@@ -2,24 +2,22 @@
 
 namespace Database\Seeders;
 
-use App\Models\User;
-use Illuminate\Database\Console\Seeds\WithoutModelEvents;
 use Illuminate\Database\Seeder;
 
 class DatabaseSeeder extends Seeder
 {
-    use WithoutModelEvents;
-
     /**
-     * Seed the application's database.
+     * Pintu masuk standar `php artisan db:seed` - KONVENSI Laravel, sama di
+     * SEMUA project (bukan cuma CetakPro). Command Post-deployment di
+     * Coolify jadi konsisten 1 baris yang sama persis buat project apapun:
+     *
+     *   php artisan migrate --force && php artisan db:seed --force
+     *
+     * Yang beda tiap project cuma daftar $this->call(...) di bawah ini -
+     * bukan command-nya.
      */
     public function run(): void
     {
-        // User::factory(10)->create();
-
-        User::factory()->create([
-            'name' => 'Test User',
-            'email' => 'test@example.com',
-        ]);
+        $this->call(RoleAndAdminSeeder::class);
     }
 }
