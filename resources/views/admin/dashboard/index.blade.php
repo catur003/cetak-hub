@@ -9,27 +9,35 @@
 <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-6">
     @php
         $cards = [
-            ['label' => 'Total Customer', 'value' => number_format($totalCustomers), 'icon' => '👥', 'bg' => 'bg-indigo-100'],
-            ['label' => 'Omzet Bulan Ini', 'value' => 'Rp '.number_format($revenueThisMonth, 0, ',', '.'), 'icon' => '💰', 'bg' => 'bg-emerald-100'],
-            ['label' => 'Pesanan Diproses', 'value' => $statusCounts->get('diproses', 0), 'icon' => '🖨️', 'bg' => 'bg-amber-100'],
-            ['label' => 'Menunggu Verifikasi', 'value' => $statusCounts->get('menunggu_verifikasi', 0), 'icon' => '⏳', 'bg' => 'bg-rose-100'],
+            ['label' => 'Total Customer', 'value' => number_format($totalCustomers), 'icon' => 'users', 'bg' => 'bg-indigo-50', 'fg' => 'text-indigo-600'],
+            ['label' => 'Omzet Bulan Ini', 'value' => 'Rp '.number_format($revenueThisMonth, 0, ',', '.'), 'icon' => 'money', 'bg' => 'bg-emerald-50', 'fg' => 'text-emerald-600'],
+            ['label' => 'Pesanan Diproses', 'value' => $statusCounts->get('diproses', 0), 'icon' => 'printer', 'bg' => 'bg-amber-50', 'fg' => 'text-amber-600'],
+            ['label' => 'Menunggu Verifikasi', 'value' => $statusCounts->get('menunggu_verifikasi', 0), 'icon' => 'clock', 'bg' => 'bg-rose-50', 'fg' => 'text-rose-600'],
+        ];
+        $icons = [
+            'users' => 'M17 20h5v-2a4 4 0 00-3-3.87M9 20H4v-2a4 4 0 013-3.87m6-4.13a4 4 0 10-4-4 4 4 0 004 4zm6 0a4 4 0 10-4-4',
+            'money' => 'M12 8c-1.66 0-3 .9-3 2s1.34 2 3 2 3 .9 3 2-1.34 2-3 2m0-8V6m0 12v-2m9-4a9 9 0 11-18 0 9 9 0 0118 0z',
+            'printer' => 'M6 9V4h12v5M6 18H4a1 1 0 01-1-1v-6a1 1 0 011-1h16a1 1 0 011 1v6a1 1 0 01-1 1h-2M6 14h12v7H6v-7z',
+            'clock' => 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z',
         ];
     @endphp
 
     @foreach ($cards as $card)
-        <div class="bg-white/80 backdrop-blur rounded-2xl p-5 shadow-sm border border-white/60">
+        <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
             <div class="flex items-start justify-between">
                 <div>
                     <p class="text-sm text-slate-500">{{ $card['label'] }}</p>
                     <p class="text-2xl font-bold text-slate-800 mt-1">{{ $card['value'] }}</p>
                 </div>
-                <div class="w-11 h-11 rounded-full {{ $card['bg'] }} flex items-center justify-center text-lg">
-                    {{ $card['icon'] }}
+                <div class="w-11 h-11 rounded-full {{ $card['bg'] }} {{ $card['fg'] }} flex items-center justify-center">
+                    <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="{{ $icons[$card['icon']] }}" />
+                    </svg>
                 </div>
             </div>
             @if ($card['label'] === 'Omzet Bulan Ini')
                 <p class="text-xs mt-2 {{ $growthPercent >= 0 ? 'text-emerald-600' : 'text-rose-500' }}">
-                    {{ $growthPercent >= 0 ? '↑' : '↓' }} {{ abs($growthPercent) }}% dari bulan lalu
+                    {{ $growthPercent >= 0 ? 'Naik' : 'Turun' }} {{ abs($growthPercent) }}% dari bulan lalu
                 </p>
             @endif
         </div>
@@ -37,14 +45,12 @@
 </div>
 
 <div class="grid grid-cols-1 xl:grid-cols-3 gap-6 mb-6">
-    {{-- Line chart --}}
-    <div class="xl:col-span-2 bg-white/80 backdrop-blur rounded-2xl p-5 shadow-sm border border-white/60">
+    <div class="xl:col-span-2 bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
         <h2 class="font-semibold text-slate-800 mb-4">Tren Omzet (30 Hari)</h2>
         <canvas id="revenueChart" height="110"></canvas>
     </div>
 
-    {{-- Donut status --}}
-    <div class="bg-white/80 backdrop-blur rounded-2xl p-5 shadow-sm border border-white/60">
+    <div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200">
         <h2 class="font-semibold text-slate-800 mb-4">Status Pesanan</h2>
         <canvas id="statusChart" height="180"></canvas>
         <div class="mt-4 space-y-2 text-sm">
@@ -58,9 +64,11 @@
     </div>
 </div>
 
-{{-- Recent orders --}}
-<div class="bg-white/80 backdrop-blur rounded-2xl p-5 shadow-sm border border-white/60 overflow-x-auto">
-    <h2 class="font-semibold text-slate-800 mb-4">Pesanan Terbaru</h2>
+<div class="bg-white rounded-2xl p-5 shadow-sm border border-slate-200 overflow-x-auto">
+    <div class="flex items-center justify-between mb-4">
+        <h2 class="font-semibold text-slate-800">Pesanan Terbaru</h2>
+        <a href="{{ route('admin.orders.index') }}" class="text-sm text-indigo-600 font-medium hover:text-indigo-700">Lihat Semua</a>
+    </div>
     <table class="w-full text-sm min-w-[600px]">
         <thead>
             <tr class="text-left text-slate-400 border-b border-slate-100">
@@ -74,7 +82,9 @@
         <tbody>
             @forelse ($recentOrders as $order)
                 <tr class="border-b border-slate-50">
-                    <td class="py-3 font-medium text-slate-700">{{ $order->order_number }}</td>
+                    <td class="py-3 font-medium text-slate-700">
+                        <a href="{{ route('admin.orders.show', $order) }}" class="hover:text-indigo-600">{{ $order->order_number }}</a>
+                    </td>
                     <td class="py-3 text-slate-600">{{ $order->user->name ?? '-' }}</td>
                     <td class="py-3 text-slate-600">Rp {{ number_format($order->total_price, 0, ',', '.') }}</td>
                     <td class="py-3">
