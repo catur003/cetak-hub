@@ -1,9 +1,17 @@
-# nixpacks.toml - CetakPro (Laravel 11)
+# nixpacks.toml - CetakPro (Laravel 12)
 #
 # Dikonfirmasi dari dokumentasi resmi Coolify (coolify.io/docs/applications/laravel,
 # dicek 6 Agustus 2026) - Nixpacks default provider Laravel CUMA jalanin
 # php-fpm+nginx, gak ada cara built-in jalanin banyak proses (php-fpm, nginx,
 # queue worker) sekaligus dalam 1 container - makanya perlu supervisor.
+#
+# FIX (6 Agustus 2026, bug nyata: halaman render tanpa CSS/Tailwind sama
+# sekali): custom [phases.build] di sini MENGGANTIKAN build phase default
+# Nixpacks (bukan nambahin) - project ini punya package.json (Breeze +
+# Tailwind + Vite, `npm run build`), tapi karena [phases.build] di-override
+# manual buat setup supervisor, langkah `npm install && npm run build`
+# gak pernah jalan otomatis lagi. WAJIB ditambahin manual di cmds di bawah -
+# lihat baris "npm install"/"npm run build" sebelum langkah supervisor.
 #
 # BEDA dari template resmi Coolify: worker QUEUE ("worker-laravel.conf")
 # SENGAJA GAK DIPASANG di sini - CetakPro Phase 1 belum punya job queue
@@ -20,6 +28,8 @@ nixPkgs = ["...", "python311Packages.supervisor"]
 
 [phases.build]
 cmds = [
+    "npm install",
+    "npm run build",
     "mkdir -p /etc/supervisor/conf.d/",
     "cp /assets/worker-*.conf /etc/supervisor/conf.d/",
     "cp /assets/supervisord.conf /etc/supervisord.conf",
