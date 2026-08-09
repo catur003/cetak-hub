@@ -1,0 +1,26 @@
+{
+  "deploy_user": "www",
+  "nginx_user": "www-data",
+  "default_folder": "/www/wwwroot",
+  "git_branch": "main",
+  "starting_port": 3000,
+  "nginx_conf_dir": "/www/server/panel/vhost/nginx",
+  "nginx_binary": "/www/server/nginx/sbin/nginx",
+  "certbot_webroot": "/var/www/certbot",
+  "certbot_email": "",
+  "db_root_user": "root",
+  "db_root_password": "",
+  "backup_dir": "/www/backup_manager",
+  "backup_retention_days": 7,
+  "nginx_log_dir": "/www/wwwlogs",
+  "runtime_default": {
+    "node": "20.9.0",
+    "php": "8.2"
+  },
+  "api": {
+    "port": 4001,
+    "key_hash": "",
+    "key_salt": ""
+  },
+  "github_accounts": []
+}
