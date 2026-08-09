@@ -1,0 +1,18 @@
+[2026-08-08 14:01:44] git rev-parse --abbrev-ref HEAD | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:44] git stash push -u -m test stash | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:44] git stash list --pretty=format:%gd|%gs | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:44] git stash list --pretty=format:%gd|%gs | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:44] git stash pop | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:44] git status --porcelain | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:49] git rev-parse --abbrev-ref HEAD | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 14:01:49] git rebase master | cwd=/home/claude/testrepo | exit=1
+[2026-08-08 14:01:49] git rebase --abort | cwd=/home/claude/testrepo | exit=0
+[2026-08-08 21:25:21] git remote get-url origin | cwd=/home/claude/testrepo2 | exit=0
+[2026-08-08 21:34:01] git diff --name-only | cwd=/home/claude/testrepo3 | exit=0
+[2026-08-08 21:34:01] git diff -- app.js | cwd=/home/claude/testrepo3 | exit=0
+[2026-08-08 21:34:14] git status --porcelain | cwd=/home/claude/testrepo4 | exit=0
+[2026-08-08 21:36:50] git status --porcelain | cwd=/home/claude/testrepo7 | exit=0
+[2026-08-08 21:37:04] git rev-parse --abbrev-ref HEAD | cwd=/home/claude/testrepo8 | exit=0
+[2026-08-08 21:37:04] git rev-parse --abbrev-ref HEAD | cwd=/home/claude/testrepo8 | exit=0
+[2026-08-08 21:37:04] git branch --list | cwd=/home/claude/testrepo8 | exit=0
+[2026-08-08 21:37:04] git config --get user.name | cwd=/home/claude/testrepo8 | exit=0

@@ -1,0 +1,914 @@
+"""
+repository.py
+Menu Repository: pilih repository, cari otomatis, clone, tambah,
+ganti, dan lihat repository aktif.
+"""
+
+import json
+import os
+import subprocess
+from typing import Optional, Tuple
+
+import questionary
+from rich.console import Console
+
+from modules.utils import run_git, is_git_repo, find_git_repos, normalize_repo_url, extract_owner_repo, spinner, redact_secrets
+from modules.settings import load_config, save_config, get_repositories, add_to_repositories, toggle_favorite, remove_from_repositories, gh_ready
+from modules.logger import log_activity, log_error
+from datetime import datetime
+
+console = Console()
+
+
+def _set_active_repository(path: str) -> None:
+    config = load_config()
+    config["active_repository"] = os.path.abspath(path)
+    save_config(config)
+    from modules.settings import add_to_repositories
+    add_to_repositories(path)
+
+
+def _valid_repo_input(raw: str) -> bool:
+    """Validasi input clone: harus URL (http/https/git@/ssh://) atau
+    shorthand 'owner/repo' yang valid."""
+    raw = raw.strip()
+    if not raw:
+        return False
+    if raw.startswith(("http://", "https://", "git@", "ssh://")):
+        return True
+    parts = raw.split("/")
+    return len(parts) == 2 and all(parts) and " " not in raw
+
+
+def _pick_clone_destination(nama_default: str) -> Optional[str]:
+    """Tanya user folder tujuan clone (default ~/<nama_default>), dengan
+    penanganan kalau folder sudah ada & tidak kosong (timpa/pilih
+    lain/batal). Return path tujuan yang sudah difinalisasi, atau None
+    kalau user membatalkan. Dipakai bareng oleh clone_repository() dan
+    create_repository() - satu sumber kebenaran untuk logic ini."""
+    home = os.path.expanduser("~")
+    while True:
+        tujuan = questionary.text(
+            f"Masukkan folder tujuan (kosongkan untuk ~/{nama_default}):", default=""
+        ).ask()
+        if tujuan is None:
+            return None
+        if tujuan.strip():
+            dest_path = tujuan.strip() if os.path.isabs(tujuan.strip()) else os.path.join(home, tujuan.strip())
+        else:
+            dest_path = os.path.join(home, nama_default)
+
+        if os.path.exists(dest_path) and os.listdir(dest_path):
+            console.print(f"[yellow]Folder '{dest_path}' sudah ada dan tidak kosong.[/yellow]")
+            aksi = questionary.select(
+                "Folder tujuan sudah terisi. Pilih aksi:",
+                choices=["Timpa (hapus isi folder lalu clone ulang)", "Pilih folder lain", "Batal"],
+            ).ask()
+            if not aksi or aksi == "Batal":
+                return None
+            if aksi == "Pilih folder lain":
+                continue
+            konfirmasi = questionary.confirm(
+                f"Yakin hapus semua isi '{dest_path}' lalu clone ulang? Aksi ini tidak dapat dibatalkan.",
+                default=False,
+            ).ask()
+            if not konfirmasi:
+                continue
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(dest_path)
+            except OSError as e:
+                console.print(f"[red]Gagal menghapus folder lama: {e}[/red]")
+                return None
+        return dest_path
+
+
+def _do_clone(url: str, dest_path: str) -> bool:
+    """Jalankan 'git clone' dengan spinner + pesan error konsisten.
+    Return True kalau berhasil. Dipakai bareng clone_repository() dan
+    create_repository()."""
+    with spinner(f"Sedang melakukan clone ke {dest_path}..."):
+        ok, out, err = run_git(["clone", url, dest_path])
+    if not ok:
+        console.print(f"[red]Clone gagal: {_human_git_error(err)}[/red]")
+        log_error("Clone repository gagal", raw_detail=err)
+        return False
+    console.print(f"[green]Clone berhasil ke {dest_path}.[/green]\n{out}")
+    log_activity(redact_secrets(f"Repository di-clone dari {url} ke {dest_path}"))
+    return True
+
+
+def clone_repository() -> None:
+    """Clone Repository Wizard: input URL/owner-repo (dengan validasi),
+    pilih folder tujuan, cek apakah folder sudah ada + konfirmasi
+    overwrite, lalu clone otomatis."""
+    raw = questionary.text(
+        "Masukkan URL repository atau 'owner/repo' (contoh: catur003/ZenStock):"
+    ).ask()
+    if not raw:
+        return
+    if not _valid_repo_input(raw):
+        console.print(
+            "[red]Format tidak valid.[/red] Gunakan URL lengkap "
+            "(https://github.com/owner/repo.git) atau bentuk singkat 'owner/repo'."
+        )
+        return
+    url = normalize_repo_url(raw)
+
+    nama_default = url.rstrip("/").split("/")[-1].replace(".git", "")
+    # PRIORITAS 2 #5: repository HARUS di-clone ke ~/<nama>, bukan ikut cwd
+    # aplikasi (sebelumnya bisa jadi ~/github-manager/ZenStock kalau app
+    # dijalankan dari situ). Selalu resolve ke path absolut di HOME.
+    dest_path = _pick_clone_destination(nama_default)
+    if not dest_path:
+        return
+
+    if not _do_clone(url, dest_path):
+        return
+
+    jadikan_aktif = questionary.confirm(
+        f"Jadikan '{nama_default}' sebagai repository aktif?", default=True
+    ).ask()
+    if jadikan_aktif:
+        _set_active_repository(dest_path)
+
+
+def _rev_list_ahead_behind(repo: str, upstream: str) -> Optional[Tuple[int, int]]:
+    """Hitung (ahead, behind) HEAD relatif ke upstream lewat
+    'git rev-list --left-right --count HEAD...<upstream>'.
+    ahead = commit lokal yang belum ada di upstream.
+    behind = commit upstream yang belum ada di lokal.
+    Return None kalau perintahnya gagal (mis. upstream tidak valid)."""
+    ok, out, _err = run_git(["rev-list", "--left-right", "--count", f"HEAD...{upstream}"], cwd=repo)
+    if not ok or not out.strip():
+        return None
+    parts = out.strip().split()
+    if len(parts) != 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def _working_tree_status(repo: str) -> Tuple[bool, int, int, int]:
+    """Baca 'git status --porcelain' dan kembalikan (is_clean, modified, deleted, untracked).
+    Ini SENGAJA dipisah dari status ahead/behind commit, supaya user bisa
+    bedain 'perubahan Git (commit)' vs 'perubahan file lokal yang belum di-commit'."""
+    ok, out, _err = run_git(["status", "--porcelain"], cwd=repo)
+    if not ok:
+        return True, 0, 0, 0
+    modified = deleted = untracked = 0
+    for line in out.splitlines():
+        if not line:
+            continue
+        code = line[:2]
+        if code == "??":
+            untracked += 1
+        elif "D" in code:
+            deleted += 1
+        else:
+            modified += 1
+    is_clean = (modified + deleted + untracked) == 0
+    return is_clean, modified, deleted, untracked
+
+
+def _print_working_tree(is_clean: bool, modified: int, deleted: int, untracked: int) -> None:
+    console.print("\n[bold]Working Tree[/bold]\n")
+    if is_clean:
+        console.print("✓ Clean")
+        return
+    if modified:
+        console.print(f"Modified  : {modified}")
+    if deleted:
+        console.print(f"Deleted   : {deleted}")
+    if untracked:
+        console.print(f"Untracked : {untracked}")
+
+
+def _trees_identical(repo: str, ref_a: str, ref_b: str) -> Optional[bool]:
+    """Bandingkan isi (tree) dua ref secara langsung, terlepas dari commit
+    hash-nya beda atau tidak. Dipakai untuk menjelaskan kasus 'Behind > 0
+    tapi diff file kosong' - commit-nya memang beda/baru di histori, tapi
+    isi filenya sama persis (paling sering ini commit merge yang cuma
+    mencatat riwayat, mis. commit 'Merge pull request' dari GitHub, tanpa
+    ada perubahan konten file apa pun). Return None kalau gagal dihitung."""
+    ok_a, tree_a, _e1 = run_git(["rev-parse", f"{ref_a}^{{tree}}"], cwd=repo)
+    ok_b, tree_b, _e2 = run_git(["rev-parse", f"{ref_b}^{{tree}}"], cwd=repo)
+    if not ok_a or not ok_b:
+        return None
+    return tree_a.strip() == tree_b.strip()
+
+
+def _diff_counts(repo: str, range_expr: str) -> Tuple[int, int, int]:
+    """Hitung (baru, berubah, hilang) dari 'git diff --name-status <range_expr>'."""
+    ok, out, _e = run_git(["diff", "--name-status", range_expr], cwd=repo)
+    baru = berubah = hilang = 0
+    if ok and out:
+        for line in out.splitlines():
+            code = line.split("\t")[0].strip()
+            if code.startswith("A"):
+                baru += 1
+            elif code.startswith("M"):
+                berubah += 1
+            elif code.startswith("D"):
+                hilang += 1
+    return baru, berubah, hilang
+
+
+def compare_repository() -> None:
+    """Repository Compare: bandingkan repository lokal dengan GitHub.
+
+    Alur baru (menggantikan versi lama yang selalu langsung 'git diff
+    HEAD..origin' tanpa cek arah, sehingga repo yang cuma 'ahead' pun bisa
+    salah ditampilkan seolah ada banyak file berubah):
+
+    1. Tentukan status lebih dulu lewat ahead/behind commit count
+       (git rev-list --left-right --count) -> Sinkron / Lokal Lebih Baru /
+       GitHub Lebih Baru / Diverged.
+    2. Diff file HANYA dihitung kalau memang relevan untuk status itu
+       (cuma saat GitHub Lebih Baru - karena itu satu-satunya kasus di mana
+       "file apa yang bakal berubah" jelas & searah).
+    3. Working Tree (perubahan file lokal yang belum di-commit) ditampilkan
+       terpisah dari status commit, supaya tidak tercampur maknanya.
+    """
+    from modules import preflight
+
+    repo = _get_active_repo_local()
+    if not repo:
+        return
+    if not preflight.preflight(repo, need_remote=True, label="Compare Repository"):
+        return
+
+    branch = preflight.get_current_branch(repo) or "-"
+    with spinner("Mengambil data terbaru dari GitHub (fetch --prune)..."):
+        run_git(["fetch", "--prune", "origin"], cwd=repo, timeout=60)
+
+    upstream = f"origin/{branch}"
+    ok_local, local_commit, _e1 = run_git(["rev-parse", "--short", "HEAD"], cwd=repo)
+    ok_remote, remote_commit, _e2 = run_git(["rev-parse", "--short", upstream], cwd=repo)
+
+    console.print("\n[bold cyan]════════ Compare Repository ════════[/bold cyan]\n")
+    console.print(f"Repository : {os.path.basename(repo)}")
+    console.print(f"Branch     : {branch}")
+
+    if not ok_remote:
+        console.print(f"\n[yellow]Branch '{branch}' tidak ditemukan di GitHub (origin/{branch}).[/yellow]")
+        return
+
+    console.print(f"\nCommit Lokal  : {local_commit if ok_local else '-'}")
+    console.print(f"Commit GitHub : {remote_commit}")
+    console.print("\n" + "─" * 28)
+
+    is_clean, modified, deleted, untracked = _working_tree_status(repo)
+    ahead_behind = _rev_list_ahead_behind(repo, upstream)
+
+    if ahead_behind is None:
+        # Fallback kalau rev-list gagal - tetap kasih info, jangan diam saja.
+        console.print("\n[yellow]Tidak bisa menentukan status ahead/behind dari Git.[/yellow]")
+        _print_working_tree(is_clean, modified, deleted, untracked)
+        return
+
+    ahead, behind = ahead_behind
+    console.print("\n[bold]Status[/bold]\n")
+
+    # --- Sinkron ---
+    if ahead == 0 and behind == 0:
+        console.print("✅ [bold green]Repository Sinkron[/bold green]")
+        _print_working_tree(is_clean, modified, deleted, untracked)
+        console.print("\nTidak ada tindakan yang diperlukan.")
+        return
+
+    # --- Lokal Lebih Baru (ahead saja) ---
+    if ahead > 0 and behind == 0:
+        console.print("🟢 [bold green]Lokal Lebih Baru[/bold green]\n")
+        console.print(f"Ahead  : {ahead} commit")
+        console.print(f"Behind : {behind} commit")
+        _print_working_tree(is_clean, modified, deleted, untracked)
+        console.print("\nRepository lokal memiliki commit\nyang belum ada di GitHub.")
+        console.print("\n[bold]Tindakan Disarankan[/bold]\n\n✓ Push Repository")
+        # Sengaja TIDAK menghitung/menampilkan File Baru/Berubah/Hilang di sini -
+        # commit yang beda arahnya cuma dari lokal, belum tentu relevan
+        # dibandingkan terhadap remote.
+
+        aksi = questionary.select("Pilih aksi:", choices=["Push Repository", "Batal"]).ask()
+        if aksi == "Push Repository":
+            from modules import push as push_module
+            push_module.push()
+        return
+
+    # --- GitHub Lebih Baru (behind saja) ---
+    if ahead == 0 and behind > 0:
+        console.print("🔵 [bold blue]GitHub Lebih Baru[/bold blue]\n")
+        console.print(f"Ahead  : {ahead}")
+        console.print(f"Behind : {behind}")
+
+        baru, berubah, hilang = _diff_counts(repo, f"HEAD..{upstream}")
+        console.print("\n[bold]Perubahan dari GitHub[/bold]\n")
+        console.print(f"🟢 File Baru      : {baru}")
+        console.print(f"🟡 File Berubah   : {berubah}")
+        console.print(f"🔴 File Hilang    : {hilang}")
+
+        if baru + berubah + hilang == 0:
+            # Behind > 0 tapi diff file kosong - ini KELIHATAN kontradiktif,
+            # jadi jangan diam saja. Cek langsung isi (tree) HEAD vs upstream:
+            # kalau memang identik, commit "baru" itu cuma catatan riwayat
+            # (mis. commit merge dari GitHub) tanpa perubahan konten apa pun.
+            identik = _trees_identical(repo, "HEAD", upstream)
+            if identik:
+                console.print(
+                    "\n[cyan]ℹ Ada commit baru di GitHub, tapi isi filenya identik "
+                    "dengan lokal. Kemungkinan itu commit merge yang cuma mencatat "
+                    "riwayat (mis. \"Merge pull request\"), tanpa perubahan konten "
+                    "file apa pun.[/cyan]"
+                )
+            else:
+                console.print(
+                    "\n[yellow]⚠ Behind > 0 tapi 'git diff --name-status' tidak "
+                    "mendeteksi perubahan file. Jalankan Pull untuk memastikan "
+                    "repository benar-benar tersinkron.[/yellow]"
+                )
+
+        _print_working_tree(is_clean, modified, deleted, untracked)
+        console.print("\n[bold]Tindakan Disarankan[/bold]\n\n✓ Pull Repository")
+
+        aksi = questionary.select(
+            "Pilih aksi:", choices=["Pull Repository", "Clone ulang repository", "Batal"]
+        ).ask()
+        if aksi == "Pull Repository":
+            from modules import pull as pull_module
+            pull_module.pull()
+        elif aksi == "Clone ulang repository":
+            _reclone_repository(repo)
+        return
+
+    # --- Diverged (ahead & behind sama-sama > 0) ---
+    console.print("🟠 [bold dark_orange]Repository Diverged[/bold dark_orange]\n")
+    console.print(f"Ahead  : {ahead}")
+    console.print(f"Behind : {behind}")
+    console.print("\nRepository lokal dan GitHub\nsama-sama memiliki commit baru.")
+    console.print("\n[yellow]Push atau Pull langsung dapat\nmenyebabkan konflik.[/yellow]")
+    # Sengaja tidak memaksa hitung diff satu arah - kedua sisi sama-sama
+    # punya perubahan, jadi "File Baru/Berubah/Hilang" versi satu arah
+    # cuma akan menyesatkan.
+    _print_working_tree(is_clean, modified, deleted, untracked)
+    console.print("\n[bold]Tindakan Disarankan[/bold]\n\n✓ Fetch\n✓ Review Commit\n✓ Merge / Rebase")
+
+    aksi = questionary.select(
+        "Pilih aksi:",
+        choices=["Fetch ulang", "Lihat Log Commit (Review)", "Batal"],
+    ).ask()
+    if aksi == "Fetch ulang":
+        with spinner("Fetch ulang dari origin (--prune)..."):
+            run_git(["fetch", "--prune", "origin"], cwd=repo, timeout=60)
+        console.print("[green]Fetch selesai.[/green]")
+    elif aksi == "Lihat Log Commit (Review)":
+        ok_log, log_out, _e = run_git(
+            ["log", "--oneline", "--graph", "--left-right", f"HEAD...{upstream}"], cwd=repo
+        )
+        if ok_log and log_out:
+            console.print(f"\n{log_out}")
+        else:
+            console.print("[yellow]Tidak ada log yang bisa ditampilkan.[/yellow]")
+
+
+def _reclone_repository(repo: str) -> None:
+    """Hapus folder repo lama lalu clone ulang dari remote 'origin'.
+    Minta user ketik ulang path persis untuk konfirmasi, supaya tidak
+    salah menghapus folder yang bukan dimaksud."""
+    ok, url, _err = run_git(["remote", "get-url", "origin"], cwd=repo)
+    if not ok or not url:
+        console.print("[red]Tidak bisa mendapatkan URL remote 'origin'.[/red]")
+        return
+    console.print(
+        f"[yellow]⚠ Ini akan MENGHAPUS folder berikut lalu clone ulang dari awal:[/yellow]\n{repo}\n"
+    )
+    ketik = questionary.text(
+        "Ketik ulang path di atas PERSIS untuk konfirmasi (disarankan copy-paste):"
+    ).ask()
+    if ketik is None or ketik.strip() != repo:
+        console.print("[yellow]Dibatalkan (path tidak cocok).[/yellow]")
+        return
+    try:
+        import shutil as _shutil
+        with spinner("Menghapus folder lama..."):
+            _shutil.rmtree(repo)
+        with spinner(redact_secrets(f"Clone ulang dari {url}...")):
+            ok2, out, err = run_git(["clone", url, repo])
+        if not ok2:
+            console.print(f"[red]Clone ulang gagal: {_human_git_error(err)}[/red]")
+            log_error("Clone ulang gagal", raw_detail=err)
+            return
+        console.print(f"[green]✓ Clone ulang berhasil ke {repo}[/green]")
+        log_activity(f"Repository di-clone ulang: {repo}")
+        _set_active_repository(repo)
+    except OSError as e:
+        console.print(f"[red]Gagal menghapus/clone ulang: {e}[/red]")
+        log_error("Gagal clone ulang", e)
+
+
+def _get_active_repo_local() -> str | None:
+    config = load_config()
+    repo = config.get("active_repository", "")
+    if not repo:
+        console.print("[yellow]Repository tidak ditemukan. Silakan pilih repository terlebih dahulu.[/yellow]")
+        return None
+    return repo
+
+
+def _human_git_error(stderr: str) -> str:
+    """Ubah pesan error git mentah menjadi pesan ramah pengguna."""
+    stderr_lower = stderr.lower()
+    if "not found" in stderr_lower or "does not exist" in stderr_lower:
+        return "Repository tidak ditemukan. Silakan pilih repository terlebih dahulu."
+    if "already exists" in stderr_lower:
+        return "Folder tujuan sudah ada dan tidak kosong."
+    if "could not resolve host" in stderr_lower or "network" in stderr_lower:
+        return "Tidak dapat terhubung ke internet. Periksa koneksi kamu."
+    if "authentication" in stderr_lower or "permission denied" in stderr_lower:
+        return "Autentikasi gagal. Periksa username/token/SSH key kamu."
+    return stderr or "Terjadi kesalahan yang tidak diketahui."
+
+
+# Template .gitignore yang paling umum dipakai (subset dari daftar resmi
+# GitHub di github/gitignore) - biar pilihan gak kepanjangan/scroll terus
+# di layar HP. Nama harus PERSIS sama seperti nama file template di GitHub
+# (case-sensitive), karena ini langsung dioper ke 'gh repo create --gitignore'.
+GITIGNORE_TEMPLATES = [
+    "Node", "Python", "Java", "Go", "C++", "C", "Ruby", "Swift",
+    "Android", "macOS", "VisualStudioCode",
+]
+
+
+def create_repository() -> None:
+    """Buat Repository Baru di GitHub - setara tombol 'New repository' di
+    web GitHub, termasuk opsi centang 'Add a README file' & pilih template
+    .gitignore, lalu (opsional) langsung di-clone ke perangkat."""
+    if not gh_ready(console, "Buat Repository Baru"):
+        return
+
+    nama = questionary.text("Nama repository baru:").ask()
+    if not nama or not nama.strip():
+        console.print("[yellow]Nama repository tidak boleh kosong. Dibatalkan.[/yellow]")
+        return
+    nama = nama.strip()
+    if " " in nama:
+        console.print("[red]Nama repository tidak boleh mengandung spasi.[/red]")
+        return
+
+    deskripsi = questionary.text("Deskripsi (opsional, boleh dikosongkan):", default="").ask() or ""
+
+    visibilitas = questionary.select(
+        "Visibilitas repository:", choices=["Public", "Private"]
+    ).ask()
+    if not visibilitas:
+        console.print("[yellow]Dibatalkan.[/yellow]")
+        return
+
+    tambah_readme = questionary.confirm("Tambahkan README.md otomatis?", default=True).ask()
+
+    template_choices = GITIGNORE_TEMPLATES + ["Tidak pakai .gitignore"]
+    gitignore_pilihan = questionary.select(
+        "Template .gitignore:", choices=template_choices, default="Tidak pakai .gitignore"
+    ).ask()
+    gitignore_template = None if not gitignore_pilihan or gitignore_pilihan == "Tidak pakai .gitignore" else gitignore_pilihan
+
+    console.print(
+        f"\n[cyan]Ringkasan:[/cyan]\n"
+        f"  Nama       : {nama}\n"
+        f"  Visibilitas: {visibilitas}\n"
+        f"  README.md  : {'Ya' if tambah_readme else 'Tidak'}\n"
+        f"  .gitignore : {gitignore_template or 'Tidak pakai'}\n"
+    )
+    yakin = questionary.confirm("Buat repository ini di GitHub?", default=True).ask()
+    if not yakin:
+        console.print("[yellow]Dibatalkan.[/yellow]")
+        return
+
+    args = ["repo", "create", nama, f"--{visibilitas.lower()}"]
+    if deskripsi.strip():
+        args += ["--description", deskripsi.strip()]
+    if tambah_readme:
+        args.append("--add-readme")
+    if gitignore_template:
+        args += ["--gitignore", gitignore_template]
+
+    with spinner("Membuat repository di GitHub..."):
+        result = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=60)
+
+    if result.returncode != 0:
+        pesan = (result.stderr or result.stdout).strip()
+        console.print(f"[red]Gagal membuat repository: {pesan}[/red]")
+        log_error("Gagal gh repo create", raw_detail=result.stderr)
+        return
+
+    repo_url = (result.stdout or "").strip().splitlines()[-1] if result.stdout else ""
+    console.print(f"[green]✓ Repository berhasil dibuat.[/green]\n{repo_url}")
+    log_activity(f"Repository GitHub dibuat: {nama} ({visibilitas})")
+
+    clone_sekarang = questionary.confirm("Clone repository ini ke perangkat sekarang?", default=True).ask()
+    if not clone_sekarang:
+        return
+    if not repo_url:
+        console.print("[yellow]URL repository tidak terbaca dari output gh. Clone manual lewat menu 'Clone Repository'.[/yellow]")
+        return
+
+    dest_path = _pick_clone_destination(nama)
+    if not dest_path:
+        return
+    if not _do_clone(repo_url, dest_path):
+        return
+
+    jadikan_aktif = questionary.confirm(f"Jadikan '{nama}' sebagai repository aktif?", default=True).ask()
+    if jadikan_aktif:
+        _set_active_repository(dest_path)
+
+
+def _get_github_owner_repo(repo_path: str) -> Optional[Tuple[str, str]]:
+    """Ambil (owner, repo) dari remote 'origin' repository lokal. Return
+    None kalau repo gak punya remote origin atau bukan remote GitHub."""
+    ok, url, _err = run_git(["remote", "get-url", "origin"], cwd=repo_path)
+    if not ok or not url.strip():
+        return None
+    return extract_owner_repo(url.strip())
+
+
+def delete_repository() -> None:
+    """Hapus Repository dari GitHub (BUKAN cuma hapus dari daftar lokal).
+    Aksi ini destruktif & TIDAK bisa dibatalkan di sisi GitHub - user wajib
+    ketik ulang nama repo persis untuk konfirmasi, sama seperti pola
+    konfirmasi Force Push / Hapus Semua Stash di modul lain."""
+    if not gh_ready(console, "Hapus Repository"):
+        return
+    repo = _get_active_repo_or_pick()
+    if not repo:
+        return
+    owner_repo = _get_github_owner_repo(repo)
+    if not owner_repo:
+        console.print(
+            "[yellow]Repository ini tidak punya remote origin ke GitHub, "
+            "atau remote-nya bukan github.com. Tidak ada yang bisa dihapus di GitHub.[/yellow]"
+        )
+        return
+    owner, nama = owner_repo
+    full_name = f"{owner}/{nama}"
+
+    console.print(
+        f"[red]PERINGATAN: ini akan menghapus repository '{full_name}' DARI GITHUB, "
+        "termasuk seluruh riwayat, issue, dan Pull Request. TIDAK BISA DIBATALKAN.[/red]\n"
+        "[yellow]Folder lokal di perangkat TIDAK ikut terhapus.[/yellow]"
+    )
+    ketikan = questionary.text(f"Ketik ulang nama repository ('{nama}') untuk konfirmasi:").ask()
+    if ketikan != nama:
+        console.print("[yellow]Nama tidak cocok. Dibatalkan.[/yellow]")
+        return
+
+    with spinner(f"Menghapus '{full_name}' dari GitHub..."):
+        result = subprocess.run(
+            ["gh", "repo", "delete", full_name, "--yes"], capture_output=True, text=True, timeout=30
+        )
+    if result.returncode != 0:
+        pesan = (result.stderr or result.stdout).strip()
+        console.print(f"[red]Gagal menghapus repository: {pesan}[/red]")
+        log_error("Gagal gh repo delete", raw_detail=result.stderr)
+        return
+    console.print(f"[green]✓ Repository '{full_name}' berhasil dihapus dari GitHub.[/green]")
+    log_activity(f"Repository GitHub dihapus: {full_name}")
+
+    hapus_daftar = questionary.confirm(
+        "Hapus juga dari daftar Repository Manager? (folder di disk tetap aman)", default=True
+    ).ask()
+    if hapus_daftar:
+        remove_from_repositories(repo)
+        config = load_config()
+        if config.get("active_repository") == repo:
+            config["active_repository"] = ""
+            save_config(config)
+
+
+def ubah_visibilitas_repository() -> None:
+    """Ubah visibilitas repository di GitHub (Public <-> Private)."""
+    if not gh_ready(console, "Ubah Visibilitas Repository"):
+        return
+    repo = _get_active_repo_or_pick()
+    if not repo:
+        return
+    owner_repo = _get_github_owner_repo(repo)
+    if not owner_repo:
+        console.print(
+            "[yellow]Repository ini tidak punya remote origin ke GitHub, "
+            "atau remote-nya bukan github.com.[/yellow]"
+        )
+        return
+    owner, nama = owner_repo
+    full_name = f"{owner}/{nama}"
+
+    with spinner("Mengecek visibilitas saat ini..."):
+        result = subprocess.run(
+            ["gh", "repo", "view", full_name, "--json", "visibility"],
+            capture_output=True, text=True, timeout=20,
+        )
+    visibilitas_sekarang = None
+    if result.returncode == 0:
+        try:
+            visibilitas_sekarang = json.loads(result.stdout or "{}").get("visibility")
+        except json.JSONDecodeError:
+            pass
+
+    console.print(f"Visibilitas saat ini: [cyan]{visibilitas_sekarang or 'tidak diketahui'}[/cyan]")
+    target = questionary.select(
+        "Ubah visibilitas menjadi:", choices=["Public", "Private", "Batal"]
+    ).ask()
+    if not target or target == "Batal":
+        return
+    if visibilitas_sekarang and target.lower() == visibilitas_sekarang.lower():
+        console.print(f"[yellow]Repository sudah berstatus {target}.[/yellow]")
+        return
+
+    if target == "Public":
+        console.print(
+            "[yellow]PERHATIAN: repository akan terlihat publik oleh siapa saja "
+            "(termasuk isi kode, riwayat commit, dan issue).[/yellow]"
+        )
+    else:
+        console.print(
+            "[yellow]PERHATIAN: repository akan disembunyikan dari publik. "
+            "Kolaborator yang belum ditambahkan manual bisa kehilangan akses.[/yellow]"
+        )
+    yakin = questionary.confirm(f"Yakin ubah '{full_name}' menjadi {target}?", default=False).ask()
+    if not yakin:
+        console.print("[yellow]Dibatalkan.[/yellow]")
+        return
+
+    with spinner(f"Mengubah visibilitas '{full_name}' menjadi {target}..."):
+        result = subprocess.run(
+            ["gh", "repo", "edit", full_name, "--visibility", target.lower(),
+             "--accept-visibility-change-consequences"],
+            capture_output=True, text=True, timeout=30,
+        )
+    if result.returncode != 0:
+        pesan = (result.stderr or result.stdout).strip()
+        console.print(f"[red]Gagal mengubah visibilitas: {pesan}[/red]")
+        log_error("Gagal gh repo edit --visibility", raw_detail=result.stderr)
+        return
+    console.print(f"[green]✓ Visibilitas '{full_name}' berhasil diubah menjadi {target}.[/green]")
+    log_activity(f"Visibilitas repository GitHub diubah: {full_name} -> {target}")
+
+
+def _get_active_repo_or_pick() -> Optional[str]:
+    """Ambil repository aktif dari config; kalau belum ada, biarkan user
+    pilih dari daftar tersimpan. Dipakai oleh fitur yang butuh tahu
+    'repo mana' sebelum bisa jalan (Hapus Repository, Ubah Visibilitas)."""
+    active_repo = load_config().get("active_repository", "")
+    if active_repo and is_git_repo(active_repo):
+        return active_repo
+    repos = get_repositories()
+    if not repos:
+        console.print("[yellow]Belum ada repository aktif atau tersimpan. Pilih/clone repository dulu.[/yellow]")
+        return None
+    choices = [os.path.basename(r["path"]) + f" | {r['path']}" for r in repos] + ["Batal"]
+    pilihan = questionary.select("Pilih repository:", choices=choices).ask()
+    if not pilihan or pilihan == "Batal":
+        return None
+    return pilihan.split(" | ", 1)[-1]
+
+
+def tambah_repository_manual() -> None:
+    """
+    Tambah repository dengan memasukkan path secara manual.
+    BUGFIX: fungsi ini sebelumnya cuma ada di menu() lama yang dead code
+    (tidak pernah dipanggil dari github-manager.py) - Repository Manager
+    yang aktif dipakai sebelumnya cuma punya Scan (auto-discover di HOME)
+    dan Clone, jadi repo yang lokasinya di luar jangkauan scan tidak
+    mungkin ditambahkan. Sekarang ditautkan ke Repository Manager yang
+    aktif supaya kemampuan ini kembali bisa dipakai.
+    """
+    path = questionary.text("Masukkan path folder repository:").ask()
+    if not path:
+        return
+    path = os.path.expanduser(path.strip())
+    if not is_git_repo(path):
+        console.print("[red]Repository tidak ditemukan. Pastikan folder tersebut adalah repository Git "
+                       "(mengandung folder .git).[/red]")
+        return
+    _set_active_repository(path)
+    console.print(f"[green]Repository '{path}' berhasil ditambahkan dan dijadikan aktif.[/green]")
+    log_activity(f"Repository ditambahkan (manual): {path}")
+
+
+def repository_manager() -> None:
+    """Menu baru: Repository Manager sesuai spec update."""
+    while True:
+        console.rule("[bold cyan]Repository Manager")
+        repos = get_repositories()  # from settings
+        if not repos:
+            console.print("[yellow]Belum ada repository tersimpan. Gunakan scan, clone, buat baru, atau tambah manual.[/yellow]")
+            choice = questionary.select(
+                "Pilih aksi:",
+                choices=["Scan Repositories", "Clone Repository", "Buat Repository Baru (GitHub)", "Tambah Manual", "Kembali"],
+            ).ask()
+            if choice == "Scan Repositories":
+                scan_repositories()
+            elif choice == "Clone Repository":
+                clone_repository()
+            elif choice == "Buat Repository Baru (GitHub)":
+                create_repository()
+            elif choice == "Tambah Manual":
+                tambah_repository_manual()
+            elif choice == "Kembali":
+                return
+            continue
+
+        # Favorit selalu tampil paling atas, sisanya ikut urutan last_open (get_repositories sudah sort).
+        repos = sorted(repos, key=lambda r: (not r.get("favorite", False),))
+
+        active_repo = load_config().get("active_repository")
+
+        # Prepare choices with status
+        choices = []
+        for r in repos:
+            path = r["path"]
+            name = os.path.basename(path)
+            branch = "?"
+            status = "?"
+            if is_git_repo(path):
+                ok, branch_out, _ = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=path)
+                branch = branch_out.strip() if ok and branch_out.strip() else "?"
+                ok2, status_out, _ = run_git(["status", "--porcelain"], cwd=path)
+                status = "Clean" if ok2 and not status_out.strip() else ("Modified" if ok2 else "?")
+            else:
+                status = "Hilang"  # folder/repo tidak ditemukan lagi di disk
+            last_open = r.get("last_open", "-")
+            mark = "⭐ " if r.get("favorite", False) else ""
+            active_mark = " ✓" if path == active_repo else ""
+            choices.append(f"{mark}{name} ({branch}, {status}) - {last_open}{active_mark} | {path}")
+        choices += ["Scan Repositories", "Clone Repository", "Buat Repository Baru (GitHub)", "Tambah Manual", "Compare Repository", "Refresh", "? Search", "Favorite", "Kembali"]
+
+        pilihan = questionary.select("Pilih repository atau aksi:", choices=choices).ask()
+        if not pilihan or pilihan == "Kembali":
+            return
+        if pilihan == "Scan Repositories":
+            scan_repositories()
+            continue
+        if pilihan == "Clone Repository":
+            clone_repository()
+            continue
+        if pilihan == "Buat Repository Baru (GitHub)":
+            create_repository()
+            continue
+        if pilihan == "Tambah Manual":
+            tambah_repository_manual()
+            continue
+        if pilihan == "Compare Repository":
+            compare_repository()
+            continue
+        if pilihan == "Refresh":
+            continue
+        if pilihan == "? Search":
+            search_repository()
+            continue
+        if pilihan == "Favorite":
+            toggle_favorite_menu()
+            continue
+
+        # Select repo
+        selected_path = None
+        for r in repos:
+            if pilihan.endswith(f"| {r['path']}"):
+                selected_path = r['path']
+                break
+        if selected_path:
+            repo_action_menu(selected_path)
+
+
+def repo_action_menu(path: str) -> None:
+    """Sub-menu aksi untuk satu repository terpilih: Gunakan / Ubah
+    Visibilitas / Hapus dari GitHub / Hapus dari Daftar / Buka Lokasi / Batal."""
+    name = os.path.basename(path)
+    aksi = questionary.select(
+        f"Aksi untuk '{name}':",
+        choices=[
+            "Gunakan Repository",
+            "Buka Lokasi",
+            "Ubah Visibilitas (GitHub)",
+            "Hapus dari GitHub",
+            "Hapus dari Daftar",
+            "Batal",
+        ],
+    ).ask()
+    if aksi is None or aksi == "Batal":
+        return
+    if aksi == "Gunakan Repository":
+        use_repo(path)
+    elif aksi == "Buka Lokasi":
+        open_location(path)
+    elif aksi == "Ubah Visibilitas (GitHub)":
+        use_repo(path)  # pastikan repo ini aktif dulu, biar fungsinya jelas beroperasi di repo yang benar
+        ubah_visibilitas_repository()
+    elif aksi == "Hapus dari GitHub":
+        use_repo(path)
+        delete_repository()
+    elif aksi == "Hapus dari Daftar":
+        konfirmasi = questionary.confirm(
+            f"Hapus '{name}' dari daftar? (Folder di disk TIDAK akan dihapus)", default=False
+        ).ask()
+        if konfirmasi:
+            remove_from_repositories(path)
+            console.print(f"[green]'{name}' dihapus dari daftar Repository Manager.[/green]")
+            log_activity(f"Repository dihapus dari daftar: {path}")
+
+
+def scan_repositories() -> None:
+    """Scan HOME for .git folders and add to list."""
+    home = os.path.expanduser("~")
+    console.print("[cyan]Scanning for Git repositories in HOME...[/cyan]")
+    found = find_git_repos(home)
+    config = load_config()
+    repos = config.setdefault("repositories", [])
+    added = 0
+    for path in found:
+        if not any(r.get("path") == path for r in repos):
+            repos.append({
+                "path": path,
+                "last_open": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "favorite": False
+            })
+            added += 1
+    config["repositories"] = repos
+    save_config(config)
+    console.print(f"[green]Scan selesai. {added} repository baru ditambahkan.[/green]")
+
+
+def search_repository() -> None:
+    """Search repository pakai autocomplete (ketik sebagian nama, langsung muncul saran)."""
+    repos = get_repositories()
+    if not repos:
+        console.print("[yellow]Belum ada repository tersimpan.[/yellow]")
+        return
+
+    # Hitung nama folder yang duplikat supaya key autocomplete tetap unik.
+    names = [os.path.basename(r["path"]) for r in repos]
+    dupes = {n for n in names if names.count(n) > 1}
+
+    label_to_path = {}
+    for r in repos:
+        path = r["path"]
+        name = os.path.basename(path)
+        label = f"{name} ({os.path.dirname(path)})" if name in dupes else name
+        label_to_path[label] = path
+
+    pilihan = questionary.autocomplete(
+        "Cari repository (ketik nama, Tab/Enter untuk pilih):",
+        choices=list(label_to_path.keys()),
+    ).ask()
+    if not pilihan or pilihan not in label_to_path:
+        return
+    repo_action_menu(label_to_path[pilihan])
+
+
+def toggle_favorite_menu() -> None:
+    """Toggle favorite for repos."""
+    repos = get_repositories()
+    names = [os.path.basename(r["path"]) for r in repos]
+    dupes = {n for n in names if names.count(n) > 1}
+    label_to_path = {}
+    for r in repos:
+        name = os.path.basename(r["path"])
+        label = f"{name} ({r['path']})" if name in dupes else name
+        label_to_path[label] = r["path"]
+
+    pilihan = questionary.select("Pilih repo untuk toggle favorite:", choices=list(label_to_path.keys()) + ["Batal"]).ask()
+    if pilihan and pilihan != "Batal":
+        toggle_favorite(label_to_path[pilihan])
+        console.print(f"[green]Favorite toggled for {pilihan}[/green]")
+
+
+def use_repo(path: str) -> None:
+    """Gunakan repository (set active)."""
+    if is_git_repo(path):
+        _set_active_repository(path)
+        console.print(f"[green]Repository aktif: {path}[/green]")
+        log_activity(f"Repository digunakan: {path}")
+    else:
+        console.print("[red]Bukan repository Git valid.[/red]")
+
+
+def open_location(path: str) -> None:
+    """Buka lokasi di file manager (Termux), fallback tampilkan path kalau termux-open tidak ada."""
+    import shutil
+    import subprocess
+    if shutil.which("termux-open"):
+        # SECURITY: pakai list args (bukan os.system + f-string) supaya path
+        # dengan karakter khusus (', ;, $, dll) tidak bisa keluar dari
+        # konteks argumen dan dieksekusi sebagai perintah shell terpisah.
+        try:
+            result = subprocess.run(["termux-open", path], timeout=10)
+            if result.returncode != 0:
+                console.print(f"[yellow]Gagal membuka file manager. Lokasi: {path}[/yellow]")
+        except (OSError, subprocess.TimeoutExpired):
+            console.print(f"[yellow]Gagal membuka file manager. Lokasi: {path}[/yellow]")
+    else:
+        console.print(f"[cyan]termux-open tidak tersedia. Lokasi repository: {path}[/cyan]")
+
+
+

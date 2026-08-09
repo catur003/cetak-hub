@@ -1,27 +1,47 @@
 {
-  "name": "vps-manager",
-  "version": "0.2.0",
-  "description": "VPS Universal Manager - Personal DevOps CLI Tool + REST API",
+  "name": "github-cli-manager",
+  "version": "1.5.1",
+  "description": "GitHub Repository Manager CLI - kelola Git & GitHub lewat menu interaktif di Termux/Linux tanpa perlu hafal perintah Git.",
   "bin": {
-    "vps-manager": "./bin/vps-manager.js",
-    "vps-api": "./bin/vps-api.js",
-    "vps-api-keygen": "./bin/vps-api-keygen.js"
+    "github-manager": "./bin/github-manager"
   },
-  "main": "bin/vps-manager.js",
-  "type": "commonjs",
   "scripts": {
-    "start": "node bin/vps-manager.js",
-    "api": "node bin/vps-api.js",
-    "api:keygen": "node bin/vps-api-keygen.js"
+    "postinstall": "node scripts/postinstall.js"
   },
-  "dependencies": {
-    "boxen": "^5.1.2",
-    "chalk": "^4.1.2",
-    "express": "^4.19.2",
-    "inquirer": "^8.2.6",
-    "multer": "^1.4.5-lts.1"
-  },
+  "files": [
+    "bin",
+    "scripts",
+    "modules",
+    "tests",
+    "github-manager.py",
+    "requirements.txt",
+    "install.sh",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "os": [
+    "linux",
+    "android"
+  ],
   "engines": {
-    "node": ">=16"
+    "node": ">=14"
+  },
+  "keywords": [
+    "git",
+    "github",
+    "cli",
+    "termux",
+    "termux-cli",
+    "git-manager"
+  ],
+  "author": "catur003",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/catur003/github-manager.git"
+  },
+  "homepage": "https://github.com/catur003/github-manager#readme",
+  "bugs": {
+    "url": "https://github.com/catur003/github-manager/issues"
   }
 }
