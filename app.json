@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "RepoManager",
+    "slug": "repomanager",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "zen",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#EAFBFF"
+    },
+    "android": {
+      "package": "repo.manager.zenhub",
+      "versionCode": 1,
+      "softwareKeyboardLayoutMode": "resize",
+      "edgeToEdgeEnabled": true,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0FB3D8"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "repo.manager.zenhub",
+      "buildNumber": "1"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "./plugins/withKotlinMetadataSkip.js",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "enableProguardInReleaseBuilds": true,
+            "enableShrinkResourcesInReleaseBuilds": true
+          }
+        }
+      ],
+      [
+        "react-native-google-mobile-ads",
+        {
+          "androidAppId": "ca-app-pub-8421711284376884~3477255701",
+          "iosAppId": "ca-app-pub-3940256099942544~1458002511"
+        }
+      ]
+    ]
+  }
+}
