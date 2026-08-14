@@ -12,7 +12,7 @@ composer require cloudinary-labs/cloudinary-laravel
 composer require midtrans/midtrans-php
 ```
 
-## 2. Copy file dari folder ini
+## 2. Copy file dari folder in
 
 Timpa/gabungkan folder berikut ke project barumu (semua file di sini adalah TAMBAHAN/OVERRIDE di atas base Laravel + Breeze):
 - `database/migrations/*` → `database/migrations/`
